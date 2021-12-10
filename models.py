@@ -277,3 +277,92 @@ class PointGenPSG2(nn.Module):
 
         return torch.cat([x1, x2], 2)
 
+# --------------------------------------------------------------------------
+# VQ-VAE
+# --------------------------------------------------------------------------
+class VectorQuantizer(nn.Module):
+  """
+  From https://github.com/AntixK/PyTorch-VAE/blob/master/models/vq_vae.py.
+  """
+  def __init__(self, args):
+    super(VectorQuantizer, self).__init__()
+    self.K = args.num_embedding
+    self.D = args.embedding_dim
+    self.beta = args.beta
+
+    self.embedding = nn.Embedding(self.K, self.D)
+    self.embedding.weight.data.uniform_(-1 / self.K, 1 / self.K)
+  
+  def forward(self, latents):
+    latents = latents.permute(0, 2, 3, 1).contiguous()  # [B x D x H x W] -> [B x H x W x D]
+    latents_shape = latents.shape
+    flat_latents = latents.view(-1, self.D)  # [BHW x D]
+
+    # Compute L2 distance between latents and embedding weights
+    dist = torch.sum(flat_latents ** 2, dim=1, keepdim=True) + \
+           torch.sum(self.embedding.weight ** 2, dim=1) - \
+           2 * torch.matmul(flat_latents, self.embedding.weight.t())  # [BHW x K]
+
+    # Get the encoding that has the min distance
+    encoding_inds = torch.argmin(dist, dim=1).unsqueeze(1)  # [BHW, 1]
+
+    # Convert to one-hot encodings
+    device = latents.device
+    encoding_one_hot = torch.zeros(encoding_inds.size(0), self.K, device=device)
+    encoding_one_hot.scatter_(1, encoding_inds, 1)  # [BHW x K]
+
+    # Quantize the latents
+    quantized_latents = torch.matmul(encoding_one_hot, self.embedding.weight)  # [BHW, D]
+    quantized_latents = quantized_latents.view(latents_shape)  # [B x H x W x D]
+
+    # Compute the VQ Losses
+    commitment_loss = F.mse_loss(quantized_latents.detach(), latents)
+    embedding_loss = F.mse_loss(quantized_latents, latents.detach())
+
+    vq_loss = commitment_loss * self.beta + embedding_loss
+
+    # Add the residue back to the latents
+    quantized_latents = latents + (quantized_latents - latents).detach()
+
+    return quantized_latents.permute(0, 3, 1, 2).contiguous(), vq_loss  # [B x D x H x W]
+
+class VQVAE(nn.Module):
+  def __init__(self, args, vq_layer):
+    super(VQVAE, self).__init__()
+    self.args = args
+    self.vq_layer = vq_layer
+    self.nc = 3 if args.no_polar else 2
+    self.ngf = 64
+    self.ff = (2, 16)
+
+    self.encode = netD(args, self.ngf, self.nc, args.embedding_dim, self.ff)
+    self.decode = self.create_decoder(self.ngf, self.ff, self.nc)
+
+  def forward(self, x):
+    ze = self.encode(x)
+    zq, vq_loss = self.vq_layer(ze)
+    recon_imgs = self.decode(zq)
+    return recon_imgs, vq_loss
+
+  def create_decoder(self, ngf, ff, nc):
+    layers  = []
+    layers += [nn.ConvTranspose2d(self.args.embedding_dim, ngf * 8, ff, 1, 0, bias=False)]
+    layers += [nn.BatchNorm2d(ngf * 8)]
+    layers += [nn.ReLU(True)]
+
+    layers += [nn.ConvTranspose2d(ngf * 8, ngf * 4, (3,4), stride=2, padding=(0,1), bias=False)]
+    layers += [nn.BatchNorm2d(ngf * 4)]
+    layers += [nn.ReLU(True)]
+
+    layers += [nn.ConvTranspose2d(ngf * 4, ngf * 2, (4,4), stride=2, padding=(1,1), bias=False)]
+    layers += [nn.BatchNorm2d(ngf * 2)]
+    layers += [nn.ReLU(True)]
+
+    layers += [nn.ConvTranspose2d(ngf * 2, ngf * 1, (4,4), stride=2, padding=(1,1), bias=False)]
+    layers += [nn.BatchNorm2d(ngf * 1)]
+    layers += [nn.ReLU(True)]
+
+    layers += [nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False)]
+    layers += [nn.Sigmoid()]
+
+    return nn.Sequential(*layers)
